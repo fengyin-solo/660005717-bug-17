@@ -31,8 +31,8 @@ function renderVolume() {
   const [d, h, w] = vd.dimensions
   const step = 2
 
-  const wl = store.windowVal, ww = store.levelVal
-  const lower = wl - ww/2, upper = wl + ww/2
+  const ww = store.windowVal, wl = store.levelVal
+  const lower = wl - ww / 2, upper = wl + ww / 2
 
   // Sample volume as point cloud with transfer function
   const positions: number[] = [], colors: number[] = []

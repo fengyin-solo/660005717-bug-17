@@ -135,40 +135,203 @@ class ROIAnalyzeRequest(BaseModel):
     rois: list = []
 
 
+def _stats_dict(label, roi, voxels):
+    """计算 ROI 统计值。球体等所有形状共用同一口径（均值/标准差/极值/体素数/直方图）。"""
+    arr = np.array(voxels, dtype=np.float64)
+    vmin, vmax = float(np.min(arr)), float(np.max(arr))
+    if vmax > vmin:
+        histogram = np.histogram(arr, bins=10, range=(vmin, vmax))[0].tolist()
+    else:
+        histogram = [len(voxels)] + [0] * 9
+    return {
+        "id": roi.get("id"),
+        "label": label,
+        "shape": roi.get("shape", "sphere"),
+        "center": roi.get("center"),
+        "radius": roi.get("radius"),
+        "radii": roi.get("radii"),
+        "size": roi.get("size"),
+        "plane": roi.get("plane"),
+        "slice": roi.get("slice"),
+        "points": roi.get("points"),
+        "valid": True,
+        "reason": None,
+        "mean": round(float(np.mean(arr)), 2),
+        "std": round(float(np.std(arr)), 2),
+        "min": round(vmin, 2),
+        "max": round(vmax, 2),
+        "voxelCount": len(voxels),
+        "histogram": histogram,
+    }
+
+
+def _invalid(roi, label, reason):
+    return {
+        "id": roi.get("id"),
+        "label": label,
+        "shape": roi.get("shape", "sphere"),
+        "center": roi.get("center"),
+        "radius": roi.get("radius"),
+        "radii": roi.get("radii"),
+        "size": roi.get("size"),
+        "plane": roi.get("plane"),
+        "slice": roi.get("slice"),
+        "points": roi.get("points"),
+        "valid": False,
+        "reason": reason,
+        "mean": 0, "std": 0, "min": 0, "max": 0, "voxelCount": 0, "histogram": [],
+    }
+
+
+def _point_in_polygon(u, v, pts):
+    """射线法判断点 (u, v) 是否在二维多边形内（边界点算入）。"""
+    n = len(pts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        ui, vi = pts[i]
+        uj, vj = pts[j]
+        if (ui == u and vi == v) or ((vi > v) != (vj > v)):
+            x_cross = ui + (v - vi) * (uj - ui) / (vj - vi) if vj != vi else ui
+            if u <= x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
 @app.post("/api/roi")
 def analyze_roi(req: ROIAnalyzeRequest):
     results = []
+
+    try:
+        vol = np.array(req.volume, dtype=np.float64)
+        d, h, w = vol.shape
+    except Exception:
+        # 体数据本身不可用：逐个标记返回失败原因，而不是整体静默
+        for roi in req.rois:
+            results.append(_invalid(roi, roi.get("label", "roi"), "体数据不可用，无法测量"))
+        return {"rois": results}
+
     for roi in req.rois:
         center = roi.get("center", [32, 32, 32])
-        radius = roi.get("radius", 8)
         label = roi.get("label", "roi")
+        shape = roi.get("shape", "sphere")
 
-        # Extract voxels within sphere
-        voxels = []
         try:
-            vol = np.array(req.volume)
-            d, h, w = vol.shape
-            for z in range(max(0, center[2]-radius), min(d, center[2]+radius+1)):
-                for y in range(max(0, center[1]-radius), min(h, center[1]+radius+1)):
-                    for x in range(max(0, center[0]-radius), min(w, center[0]+radius+1)):
-                        if math.sqrt((x-center[0])**2 + (y-center[1])**2 + (z-center[2])**2) <= radius:
-                            voxels.append(float(vol[z, y, x]))
-        except:
-            voxels = []
+            cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        except (TypeError, ValueError, IndexError, KeyError):
+            results.append(_invalid(roi, label, "标记中心坐标不是有效数字"))
+            continue
 
-        if voxels:
-            arr = np.array(voxels)
-            results.append({
-                "label": label,
-                "center": center,
-                "radius": radius,
-                "mean": round(float(np.mean(arr)), 2),
-                "std": round(float(np.std(arr)), 2),
-                "min": round(float(np.min(arr)), 2),
-                "max": round(float(np.max(arr)), 2),
-                "voxelCount": len(voxels),
-                "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
-            })
+        center_out = not (0 <= cx < w and 0 <= cy < h and 0 <= cz < d)
+        voxels = []
+
+        if shape == "polygon":
+            pts = roi.get("points") or []
+            plane = roi.get("plane", "axial")
+            try:
+                sl = int(roi.get("slice", -1))
+            except (TypeError, ValueError):
+                sl = -1
+
+            if len(pts) < 3:
+                results.append(_invalid(roi, label, f"多边形至少需要 3 个顶点（当前 {len(pts)} 个）"))
+                continue
+            try:
+                pts = [(float(p[0]), float(p[1])) for p in pts]
+            except (TypeError, ValueError, IndexError):
+                results.append(_invalid(roi, label, "多边形顶点坐标不是有效数字"))
+                continue
+
+            if plane == "axial":
+                u_max, v_max, n_max = w, h, d
+            elif plane == "coronal":
+                u_max, v_max, n_max = w, d, h
+            else:
+                u_max, v_max, n_max = h, d, w
+            if not (0 <= sl < n_max):
+                results.append(_invalid(roi, label, f"多边形所在切片超出影像范围（0~{n_max - 1}），范围内没有可测量体素"))
+                continue
+            if any(not (0 <= u < u_max and 0 <= v < v_max) for u, v in pts):
+                results.append(_invalid(roi, label, "多边形顶点超出影像范围，范围内没有可测量体素"))
+                continue
+
+            us = sorted(set(int(round(u)) for u, _ in pts))
+            vs = sorted(set(int(round(v)) for _, v in pts))
+            for uu in range(max(0, us[0]), min(u_max, us[-1] + 1)):
+                for vv in range(max(0, vs[0]), min(v_max, vs[-1] + 1)):
+                    if _point_in_polygon(uu + 0.5, vv + 0.5, pts):
+                        if plane == "axial":
+                            voxels.append(float(vol[sl, vv, uu]))
+                        elif plane == "coronal":
+                            voxels.append(float(vol[vv, sl, uu]))
+                        else:
+                            voxels.append(float(vol[vv, uu, sl]))
+
+        elif shape == "box":
+            size = roi.get("size") or []
+            try:
+                sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+            except (TypeError, ValueError, IndexError):
+                results.append(_invalid(roi, label, "矩形长宽高不是有效数字"))
+                continue
+            if sx <= 0 or sy <= 0 or sz <= 0:
+                results.append(_invalid(roi, label, "矩形长宽高必须均为正数，范围内没有可测量体素"))
+                continue
+            if center_out:
+                results.append(_invalid(roi, label, f"标记中心超出影像范围（允许范围 x:0~{w - 1} y:0~{h - 1} z:0~{d - 1}），范围内没有可测量体素"))
+                continue
+            x0, x1 = math.ceil(cx - sx / 2), math.floor(cx + sx / 2)
+            y0, y1 = math.ceil(cy - sy / 2), math.floor(cy + sy / 2)
+            z0, z1 = math.ceil(cz - sz / 2), math.floor(cz + sz / 2)
+            for zz in range(max(0, z0), min(d, z1 + 1)):
+                for yy in range(max(0, y0), min(h, y1 + 1)):
+                    for xx in range(max(0, x0), min(w, x1 + 1)):
+                        voxels.append(float(vol[zz, yy, xx]))
+
+        elif shape == "ellipsoid":
+            radii = roi.get("radii") or []
+            try:
+                rx, ry, rz = float(radii[0]), float(radii[1]), float(radii[2])
+            except (TypeError, ValueError, IndexError):
+                results.append(_invalid(roi, label, "椭圆三轴半径不是有效数字"))
+                continue
+            if rx <= 0 or ry <= 0 or rz <= 0:
+                results.append(_invalid(roi, label, "椭圆三轴半径必须均为正数，范围内没有可测量体素"))
+                continue
+            if center_out:
+                results.append(_invalid(roi, label, f"标记中心超出影像范围（允许范围 x:0~{w - 1} y:0~{h - 1} z:0~{d - 1}），范围内没有可测量体素"))
+                continue
+            rmax = max(rx, ry, rz)
+            for zz in range(max(0, int(cz - rmax)), min(d, int(cz + rmax) + 1)):
+                for yy in range(max(0, int(cy - rmax)), min(h, int(cy + rmax) + 1)):
+                    for xx in range(max(0, int(cx - rmax)), min(w, int(cx + rmax) + 1)):
+                        if ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 + ((zz - cz) / rz) ** 2 <= 1:
+                            voxels.append(float(vol[zz, yy, xx]))
+
+        else:  # sphere（原有测量口径保持不变）
+            try:
+                radius = int(roi.get("radius", 8))
+            except (TypeError, ValueError):
+                results.append(_invalid(roi, label, "半径不是有效数字"))
+                continue
+            if radius <= 0:
+                results.append(_invalid(roi, label, "半径必须为正数，范围内没有可测量体素"))
+                continue
+            if center_out:
+                results.append(_invalid(roi, label, f"标记中心超出影像范围（允许范围 x:0~{w - 1} y:0~{h - 1} z:0~{d - 1}），范围内没有可测量体素"))
+                continue
+            for z in range(max(0, int(cz) - radius), min(d, int(cz) + radius + 1)):
+                for y in range(max(0, int(cy) - radius), min(h, int(cy) + radius + 1)):
+                    for x in range(max(0, int(cx) - radius), min(w, int(cx) + radius + 1)):
+                        if math.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) <= radius:
+                            voxels.append(float(vol[z, y, x]))
+
+        if not voxels:
+            # 标记合法但与影像没有重叠体素（如半径为 0 交集），明确告知而不是静默丢弃
+            results.append(_invalid(roi, label, "标记范围内未覆盖任何影像体素，请调整中心或大小"))
+            continue
+        results.append(_stats_dict(label, roi, voxels))
 
     return {"rois": results}
 
